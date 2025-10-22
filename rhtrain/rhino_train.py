@@ -3,7 +3,7 @@ from pathlib import Path
 from rhtrain.utils.working_path_utils import determine_run_folder
 from rhtrain.utils.read_config_utils import load_yaml_config
 from rhtrain.ddp_trainer import DDPTrainer as Trainer
-from rhcore.utils.build_modules import get_class, build_module
+from rhcore.utils.build_components import get_class, build_module
 
 torch.set_float32_matmul_precision('high')
 

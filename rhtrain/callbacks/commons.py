@@ -17,4 +17,4 @@ class VisualizationCallback(Callback):
         named = {
             'reconstructed': model(...),  # fill in with your sampling logic
         }
-        model.visualize_validation(named, batch_idx=0)
+        model.visualize_step(named, batch_idx=0)

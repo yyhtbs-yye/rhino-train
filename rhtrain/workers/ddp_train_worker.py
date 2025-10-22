@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from rhcore.utils.build_modules import get_class, build_module
+from rhcore.utils.build_components import get_class, build_module
 from rhtrain.helpers.global_step import GlobalStep
 from contextlib import nullcontext
 
@@ -21,10 +21,13 @@ def ddp_train_worker(rank, addr, port, config, data_module):
 
     # ----- Build boat -----
     boat_conf = config['boat']
-    if 'path' not in boat_conf and 'name' not in boat_conf:
-        Boat = get_class(boat_conf['_target_'])
+    if 'mpath' in boat_conf:
+        Boat = get_class(boat_conf['mpath'])
     else:
         Boat = get_class(boat_conf['path'], boat_conf['name'])
+    
+    config['rank'] = rank
+
     boat = Boat(config)
     
     # ----- Resume boat -----
@@ -120,7 +123,7 @@ def ddp_train_worker(rank, addr, port, config, data_module):
 
         if epoch % config['trainer']['val_check_epochs'] == 0:
 
-            target_metric = run_validation(boat, valid_loader, config)
+            target_metric = run_validation(boat, valid_loader, config, epoch)
 
             config['trainer']['valid_epoch_records'][epoch] = {'target_metric': target_metric.detach().cpu()}
 
@@ -175,7 +178,7 @@ def run_train(boat, train_loader, config, epoch, autocast_ctx, scaler):
 
             print(f"Training batch index: {batch_idx * batch_size * config['world_size']} / {dataset_length}, epoch: {epoch}, step: {step}, global_step: {boat.get_global_step()}")
 
-def run_validation(boat, val_dataloader, config):
+def run_validation(boat, val_dataloader, config, epoch):
 
     boat.eval()
     aggr_metrics = {}
@@ -187,19 +190,18 @@ def run_validation(boat, val_dataloader, config):
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
-            metrics, named_imgs = boat.validation_step(batch, batch_idx)
+            metrics, named_imgs = boat.validation_step(batch, batch_idx, epoch)
             for key, value in metrics.items():
                 if key not in aggr_metrics:
                     aggr_metrics[key] = metrics[key]
                 else:
                     aggr_metrics[key] += metrics[key]
-    
             if is_rank0():
-                boat.visualize_validation(named_imgs, batch_idx, config['trainer'])
+                boat.visualize_step(named_imgs, batch_idx)
                 print(f"Validation Completion: {batch_idx * batch_size * config['world_size']} / {dataset_length}, validation over {batch_idx + 1} batches done at global_step {boat.get_global_step()}")
 
         for key in aggr_metrics:
-            aggr_metrics[key] /= batch_idx
+            aggr_metrics[key] /= (batch_idx + 1)
 
     if not aggr_metrics: raise ValueError("Validation loop produced no losses.")
     
@@ -210,7 +212,7 @@ def run_validation(boat, val_dataloader, config):
         aggr_metrics[key] /= dist.get_world_size()
         aggr_metrics[key] = aggr_metrics[key]
 
-    if is_rank0() and aggr_metrics:
+    if is_rank0():
         boat.log_valid_metrics(aggr_metrics)
 
     target_metric_name = config['validation']['target_metric_name']
