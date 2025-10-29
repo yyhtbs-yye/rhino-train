@@ -6,6 +6,7 @@ import torch
 import torch.multiprocessing as mp
 from rhtrain.utils.ddp_utils import find_free_port
 from rhtrain.workers.ddp_train_worker import ddp_train_worker
+from rhtrain.workers.single_gpu_worker import train_single_gpu
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
@@ -33,8 +34,7 @@ class DDPTrainer:
 
             addr, port = "127.0.0.1", find_free_port()
 
-            ddp_train_worker(rank=0, addr=addr, port=port,
-                             config=self.config, data_module=data_module)
+            train_single_gpu(config=self.config, data_module=data_module)
 
             return
 
