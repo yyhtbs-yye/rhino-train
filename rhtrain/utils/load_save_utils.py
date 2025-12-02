@@ -27,10 +27,17 @@ def save_state(run_folder, prefix="boat_state", boat=None, global_step=None, epo
     
     # Save models individually
     model_states = {}
+    ema_model_states = {}
+    
     for name, model in boat.models.items():
         if hasattr(model, 'state_dict'):
             model_states[name] = model.state_dict()
-    
+
+    if hasattr(boat, 'ema_models'):
+        for name, model in boat.ema_models.items():
+            if hasattr(model, 'state_dict'):
+                ema_model_states[name] = model.state_dict()
+
     # Save optimizers individually
     optimizer_states = {}
     for name, optimizer in boat.optimizers.items():
@@ -46,6 +53,7 @@ def save_state(run_folder, prefix="boat_state", boat=None, global_step=None, epo
     # Prepare the state dictionary
     state = {
         'model_states': model_states,
+        'ema_model_states': ema_model_states,
         'optimizer_states': optimizer_states,
         'scheduler_states': scheduler_states,
     }
@@ -58,12 +66,6 @@ def save_state(run_folder, prefix="boat_state", boat=None, global_step=None, epo
     
     # Save training configuration, placeholder for now
     state['trainer_config'] = {}
-    
-    # Save metadata about EMA if it exists
-    if hasattr(boat, 'use_ema') and boat.use_ema:
-        state['use_ema'] = boat.use_ema
-        state['ema_decay'] = getattr(boat, 'ema_decay', 0.999)
-        state['ema_start'] = getattr(boat, 'ema_start', 1000)
     
     # Save the state
     torch.save(state, state_path)
@@ -109,6 +111,15 @@ def load_state(state_path, boat=None, strict=True):
             else:
                 print(f"Warning: Model {name} in saved state not found in boat")
     
+    if boat is not None and 'ema_model_states' in state:
+        ema_model_states = state['ema_model_states']
+        for name, state_dict in ema_model_states.items():
+            if hasattr(boat, 'ema_models'):
+                if name in boat.ema_models:
+                    boat.ema_models[name].load_state_dict(strip_module_from_state_dict(state_dict), strict=strict)
+                else:
+                    print(f"Warning: Model {name} in saved state not found in boat")
+
     # Load optimizer states
     if boat is not None and 'optimizer_states' in state:
         optimizer_states = state['optimizer_states']
@@ -126,14 +137,6 @@ def load_state(state_path, boat=None, strict=True):
                 boat.lr_schedulers[name].load_state_dict(state_dict)
             else:
                 print(f"Warning: LR Scheduler {name} in saved state not found in boat")
-    
-    # Load EMA settings if they exist
-    if boat is not None and 'use_ema' in state:
-        boat.use_ema = state['use_ema']
-        if 'ema_decay' in state:
-            boat.ema_decay = state['ema_decay']
-        if 'ema_start' in state:
-            boat.ema_start = state['ema_start']
     
     # Get training metadata
     metadata = {

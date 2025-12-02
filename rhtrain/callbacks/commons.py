@@ -17,4 +17,4 @@ class VisualizationCallback(Callback):
         named = {
             'reconstructed': model(...),  # fill in with your sampling logic
         }
-        model.visualize_step(named, batch_idx=0)
+        model.save_images(named, batch_idx=0)

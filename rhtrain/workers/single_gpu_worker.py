@@ -11,7 +11,6 @@ from rhtrain.utils.ddp_utils import (
     get_primary_trainable_module,  # still useful to locate the main trainable module
 )
 
-
 def train_single_gpu(config, data_module):
     """
     Single-GPU trainer equivalent of `ddp_train_worker`.
@@ -96,7 +95,7 @@ def train_single_gpu(config, data_module):
     else:
         autocast_ctx = lambda: nullcontext()
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(precision == "16-mixed")) if device.type == "cuda" else None
+    scaler = torch.amp.GradScaler(enabled=(precision == "16-mixed")) if device.type == "cuda" else None
 
     # ----- Dataloaders (world_size=1, rank=0) -----
     train_loader = data_module.make_train_loader(world_size=1, rank=0)
@@ -120,19 +119,17 @@ def train_single_gpu(config, data_module):
         for cb in callbacks:
             cb.on_epoch_start(config['trainer'], boat, epoch)
 
-        _run_train_single(boat, train_loader, config, epoch, autocast_ctx, scaler)
+        run_train(boat, train_loader, config, epoch, autocast_ctx, scaler)
 
         if epoch % val_check_epochs == 0:
-            target_metric = _run_validation_single(boat, valid_loader, config, epoch)
+            target_metric = run_validation(boat, valid_loader, config, epoch)
             config['trainer']['valid_epoch_records'][epoch] = {'target_metric': target_metric.detach().cpu()}
 
             if state_save_epochs is not None and epoch % state_save_epochs == 0:
-                state_path = boat.save_state(
-                    config['trainer']['run_folder'],
-                    'boat_state',
-                    global_step=config['trainer']['global_step'](),
-                    epoch=epoch + 1,
-                )
+                state_path = boat.save_state(config['trainer']['run_folder'], 'boat_state', global_step=config['trainer']['global_step'](), epoch=epoch+1)
+                
+                if epoch not in config['trainer']['valid_epoch_records']:
+                    config['trainer']['valid_epoch_records'][epoch] = {}
                 config['trainer']['valid_epoch_records'][epoch]['state_path'] = state_path
 
         for cb in callbacks:
@@ -142,13 +139,16 @@ def train_single_gpu(config, data_module):
         cb.on_train_end(config['trainer'], boat)
 
 
-def _run_train_single(boat, train_loader, config, epoch, autocast_ctx, scaler):
+def run_train(boat, train_loader, config, epoch, autocast_ctx, scaler):
     boat.train()
 
     dataset_length = len(train_loader.dataset) if hasattr(train_loader, 'dataset') else len(train_loader)
     batch_size = getattr(train_loader, 'batch_size', None)
+    
+    step = 0
 
-    for step, (batch_idx_batch) in enumerate(train_loader, start=1):
+    for batch_idx_batch in train_loader:
+        step += 1
         # dataloader may yield either (batch_idx, batch) or just batch
         if isinstance(batch_idx_batch, tuple):
             batch_idx, batch = batch_idx_batch
@@ -161,10 +161,10 @@ def _run_train_single(boat, train_loader, config, epoch, autocast_ctx, scaler):
         boat.global_step += 1
 
         with autocast_ctx():
-            losses = boat.training_step(batch, batch_idx, epoch, scaler=scaler)
+            losses = boat.training_all(batch, batch_idx, epoch, scaler=scaler)
 
         if losses:
-            boat.log_train_losses(losses)
+            boat.take_a_log(losses, 'train')
             if batch_size is not None:
                 progressed = batch_idx * batch_size  # world_size=1
                 print(f"Training batch index: {progressed} / {dataset_length}, epoch: {epoch}, step: {step}, global_step: {boat.get_global_step()}")
@@ -172,7 +172,7 @@ def _run_train_single(boat, train_loader, config, epoch, autocast_ctx, scaler):
                 print(f"Training: epoch={epoch}, step={step}, global_step={boat.get_global_step()}")
 
 
-def _run_validation_single(boat, val_dataloader, config, epoch):
+def run_validation(boat, val_dataloader, config, epoch):
     boat.eval()
     aggr_metrics = {}
 
@@ -189,7 +189,7 @@ def _run_validation_single(boat, val_dataloader, config, epoch):
                 else:
                     aggr_metrics[key] += value
 
-            boat.visualize_step(named_imgs, batch_idx)
+            boat.save_images(named_imgs, batch_idx)
             if batch_size is not None:
                 progressed = batch_idx * batch_size  # world_size=1
                 print(f"Validation Completion: {progressed} / {dataset_length}, validation over {batch_idx + 1} batches done at global_step {boat.get_global_step()}")
@@ -203,7 +203,7 @@ def _run_validation_single(boat, val_dataloader, config, epoch):
         for key in aggr_metrics:
             aggr_metrics[key] /= (batch_idx + 1)
 
-    boat.log_valid_metrics(aggr_metrics)
+    boat.take_a_log(aggr_metrics, 'valid')
 
     target_metric_name = config['validation']['target_metric_name']
     if target_metric_name not in aggr_metrics:

@@ -6,6 +6,7 @@ from torch.utils.data import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from rhcore.utils.build_components import get_class, build_module
 from rhtrain.helpers.global_step import GlobalStep
+
 from contextlib import nullcontext
 
 from rhtrain.utils.ddp_utils import (
@@ -102,7 +103,7 @@ def ddp_train_worker(rank, addr, port, config, data_module):
         autocast_ctx = lambda: nullcontext()
 
     if precision is not None:
-        scaler = torch.cuda.amp.GradScaler(enabled=(precision=="16-mixed"))
+        scaler = torch.amp.GradScaler(enabled=(precision=="16-mixed"))
     else:
         scaler = None
     
@@ -122,9 +123,7 @@ def ddp_train_worker(rank, addr, port, config, data_module):
         run_train(boat, train_loader, config, epoch, autocast_ctx, scaler)
 
         if epoch % config['trainer']['val_check_epochs'] == 0:
-
             target_metric = run_validation(boat, valid_loader, config, epoch)
-
             config['trainer']['valid_epoch_records'][epoch] = {'target_metric': target_metric.detach().cpu()}
 
             if is_rank0():
@@ -155,9 +154,12 @@ def run_train(boat, train_loader, config, epoch, autocast_ctx, scaler):
     dataset_length = len(train_loader.dataset) if hasattr(train_loader, 'dataset') else len(train_loader)
     batch_size = train_loader.batch_size if hasattr(train_loader, 'batch_size') else None
 
-    for step, (batch_idx_batch) in enumerate(train_loader, start=1):
+    step = 0
 
-        # dataloader yields dict already; support both tuple or single
+    for batch_idx_batch in train_loader:
+
+        step += 1
+
         if isinstance(batch_idx_batch, tuple):
             batch_idx, batch = batch_idx_batch
         else:
@@ -170,12 +172,10 @@ def run_train(boat, train_loader, config, epoch, autocast_ctx, scaler):
 
         # no_sync across all DDP modules until boundary; AMP is trainer-owned
         with autocast_ctx():
-            losses = boat.training_step(batch, batch_idx, epoch, scaler=scaler)
+            losses = boat.training_all(batch, batch_idx, epoch, scaler=scaler)
 
         if is_rank0() and losses:
-            
-            boat.log_train_losses(losses)
-
+            boat.take_a_log(losses, 'train')
             print(f"Training batch index: {batch_idx * batch_size * config['world_size']} / {dataset_length}, epoch: {epoch}, step: {step}, global_step: {boat.get_global_step()}")
 
 def run_validation(boat, val_dataloader, config, epoch):
@@ -197,7 +197,7 @@ def run_validation(boat, val_dataloader, config, epoch):
                 else:
                     aggr_metrics[key] += metrics[key]
             if is_rank0():
-                boat.visualize_step(named_imgs, batch_idx)
+                boat.save_images(named_imgs, batch_idx)
                 print(f"Validation Completion: {batch_idx * batch_size * config['world_size']} / {dataset_length}, validation over {batch_idx + 1} batches done at global_step {boat.get_global_step()}")
 
         for key in aggr_metrics:
@@ -213,7 +213,7 @@ def run_validation(boat, val_dataloader, config, epoch):
         aggr_metrics[key] = aggr_metrics[key]
 
     if is_rank0():
-        boat.log_valid_metrics(aggr_metrics)
+        boat.take_a_log(aggr_metrics, 'valid')
 
     target_metric_name = config['validation']['target_metric_name']
 
