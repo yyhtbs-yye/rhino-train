@@ -1,5 +1,7 @@
 from pathlib import Path
 from contextlib import nullcontext
+import gc
+import time
 
 import torch
 from torch.utils.data import DistributedSampler  # ok if your datamodule returns one; works with num_replicas=1
@@ -105,13 +107,10 @@ def train_single_gpu(config, data_module):
     callbacks = [build_module(cb) for cb in (config.get('callbacks', []))]
     config['trainer']['valid_epoch_records'] = {}
 
-    # ----- Train loop -----
-    start_epoch = config['trainer']['start_epoch']
-    max_epochs = config['trainer'].get("max_epochs", 10)
-    val_check_epochs = config['trainer'].get("val_check_epochs", 1)
-    state_save_epochs = config['trainer'].get("state_save_epochs")
+    if config['trainer'].get('validate_before_training', False):
+        target_metric = run_validation(boat, valid_loader, config, -1)
 
-    for epoch in range(start_epoch, max_epochs):
+    for epoch in range(config['trainer']['start_epoch'], config['trainer'].get("max_epochs", 10)):
         # If the dataloader gives a DistributedSampler with num_replicas=1, we can still set its epoch
         if isinstance(getattr(train_loader, "sampler", None), DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
@@ -121,16 +120,20 @@ def train_single_gpu(config, data_module):
 
         run_train(boat, train_loader, config, epoch, autocast_ctx, scaler)
 
-        if epoch % val_check_epochs == 0:
+        if epoch % config['trainer']['val_check_epochs'] == 0:
             target_metric = run_validation(boat, valid_loader, config, epoch)
             config['trainer']['valid_epoch_records'][epoch] = {'target_metric': target_metric.detach().cpu()}
 
-            if state_save_epochs is not None and epoch % state_save_epochs == 0:
+            if config['trainer']['state_save_epochs'] is not None and epoch % config['trainer']['state_save_epochs'] == 0:
                 state_path = boat.save_state(config['trainer']['run_folder'], 'boat_state', global_step=config['trainer']['global_step'](), epoch=epoch+1)
                 
                 if epoch not in config['trainer']['valid_epoch_records']:
                     config['trainer']['valid_epoch_records'][epoch] = {}
                 config['trainer']['valid_epoch_records'][epoch]['state_path'] = state_path
+
+        if ('offline_evaluation' in config
+                and epoch % config['trainer']['eval_check_epochs'] == 0):
+            run_offline_evaluation(boat, valid_loader, config)
 
         for cb in callbacks:
             cb.on_epoch_end(config['trainer'], boat, epoch)
@@ -139,13 +142,30 @@ def train_single_gpu(config, data_module):
         cb.on_train_end(config['trainer'], boat)
 
 
+def _format_eta(seconds):
+    if seconds is None:
+        return "N/A"
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def run_train(boat, train_loader, config, epoch, autocast_ctx, scaler):
     boat.train()
 
     dataset_length = len(train_loader.dataset) if hasattr(train_loader, 'dataset') else len(train_loader)
     batch_size = getattr(train_loader, 'batch_size', None)
+
+    try:
+        steps_per_epoch = len(train_loader)
+    except TypeError:
+        steps_per_epoch = None
     
     step = 0
+    epoch_start_time = time.time()
 
     for batch_idx_batch in train_loader:
         step += 1
@@ -165,11 +185,18 @@ def run_train(boat, train_loader, config, epoch, autocast_ctx, scaler):
 
         if losses:
             boat.take_a_log(losses, 'train')
-            if batch_size is not None:
-                progressed = batch_idx * batch_size  # world_size=1
-                print(f"Training batch index: {progressed} / {dataset_length}, epoch: {epoch}, step: {step}, global_step: {boat.get_global_step()}")
-            else:
-                print(f"Training: epoch={epoch}, step={step}, global_step={boat.get_global_step()}")
+            eta_seconds = None
+            if steps_per_epoch is not None and step > 0:
+                elapsed = time.time() - epoch_start_time
+                avg_step = elapsed / step
+                remaining_steps = max(steps_per_epoch - step, 0)
+                eta_seconds = remaining_steps * avg_step
+            eta_str = _format_eta(eta_seconds)
+            print(
+                f"Training batch index: {batch_idx * batch_size * config['world_size']} / {dataset_length}, "
+                f"epoch: {epoch}, step: {step}, global_step: {boat.get_global_step()}, "
+                f"eta_epoch: {eta_str}"
+            )
 
 
 def run_validation(boat, val_dataloader, config, epoch):
@@ -196,6 +223,11 @@ def run_validation(boat, val_dataloader, config, epoch):
             else:
                 print(f"Validation: batch {batch_idx + 1}, global_step {boat.get_global_step()}")
 
+            # help GC
+            del batch, metrics, named_imgs
+            gc.collect()
+            torch.cuda.empty_cache()
+
         # Average across batches (single GPU, no all-reduce)
         if not aggr_metrics:
             raise ValueError("Validation loop produced no losses.")
@@ -209,4 +241,26 @@ def run_validation(boat, val_dataloader, config, epoch):
     if target_metric_name not in aggr_metrics:
         raise KeyError(f"'{target_metric_name}' not found in validation metrics: {list(aggr_metrics)}")
 
+    # after loop:
+    gc.collect()
+    torch.cuda.empty_cache()
+
     return aggr_metrics[target_metric_name]
+
+
+def run_offline_evaluation(boat, dataloader, config):
+    boat.eval()
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            boat.offline_evaluation_iter(batch, batch_idx)
+
+    offline_metrics = boat.offline_evaluation_final()
+    if offline_metrics is not None and len(offline_metrics) > 0:
+        boat.take_a_log(offline_metrics, 'eval')
+
+    # after loop:
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return None

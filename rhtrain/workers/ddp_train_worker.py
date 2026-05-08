@@ -1,3 +1,5 @@
+import gc
+import time
 from pathlib import Path
 
 import torch
@@ -15,6 +17,7 @@ from rhtrain.utils.ddp_utils import (
     is_rank0, is_dist_ready,
     get_primary_trainable_module,
 )
+
 
 def ddp_train_worker(rank, addr, port, config, data_module):
     
@@ -110,6 +113,9 @@ def ddp_train_worker(rank, addr, port, config, data_module):
     # Dataloaders
     train_loader = data_module.make_train_loader(config['world_size'], rank)
     valid_loader = data_module.make_valid_loader(config['world_size'], rank)
+    
+    if config['trainer'].get('validate_before_training', False):
+        target_metric = run_validation(boat, valid_loader, config, -1)
 
     # Train
     for epoch in range(config['trainer']['start_epoch'], config['trainer'].get("max_epochs", 10)):
@@ -134,29 +140,51 @@ def ddp_train_worker(rank, addr, port, config, data_module):
                         config['trainer']['valid_epoch_records'][epoch] = {}
                     config['trainer']['valid_epoch_records'][epoch]['state_path'] = state_path
 
+        if ('offline_evaluation' in config
+                and epoch % config['trainer']['eval_check_epochs'] == 0):
+            run_offline_evaluation(boat, valid_loader, config)
+
         # Sync EMA after each epoch
         if ema_keys and primary is not None:
             for k in ema_keys:
                 broadcast_module_state(boat.models[k], src_rank=0)
-        
+
         if is_rank0():
             for cb in callbacks: cb.on_epoch_end(config['trainer'], boat, epoch)
-        
+
     if is_rank0():
         for cb in callbacks: cb.on_train_end(config['trainer'], boat)
 
     dist.destroy_process_group()
 
-def run_train(boat, train_loader, config, epoch, autocast_ctx, scaler):
+
+def _format_eta(seconds):
+    if seconds is None:
+        return "N/A"
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def run_train(boat, dataloader, config, epoch, autocast_ctx, scaler):
 
     boat.train()
 
-    dataset_length = len(train_loader.dataset) if hasattr(train_loader, 'dataset') else len(train_loader)
-    batch_size = train_loader.batch_size if hasattr(train_loader, 'batch_size') else None
+    dataset_length = len(dataloader.dataset) if hasattr(dataloader, 'dataset') else len(dataloader)
+    batch_size = dataloader.batch_size if hasattr(dataloader, 'batch_size') else None
+
+    try:
+        steps_per_epoch = len(dataloader)
+    except TypeError:
+        steps_per_epoch = None
 
     step = 0
+    epoch_start_time = time.time()
 
-    for batch_idx_batch in train_loader:
+    for batch_idx_batch in dataloader:
 
         step += 1
 
@@ -176,20 +204,32 @@ def run_train(boat, train_loader, config, epoch, autocast_ctx, scaler):
 
         if is_rank0() and losses:
             boat.take_a_log(losses, 'train')
-            print(f"Training batch index: {batch_idx * batch_size * config['world_size']} / {dataset_length}, epoch: {epoch}, step: {step}, global_step: {boat.get_global_step()}")
+            eta_seconds = None
+            if steps_per_epoch is not None and step > 0:
+                elapsed = time.time() - epoch_start_time
+                avg_step = elapsed / step
+                remaining_steps = max(steps_per_epoch - step, 0)
+                eta_seconds = remaining_steps * avg_step
+            eta_str = _format_eta(eta_seconds)
+            print(
+                f"Training batch index: {batch_idx * batch_size * config['world_size']} / {dataset_length}, "
+                f"epoch: {epoch}, step: {step}, global_step: {boat.get_global_step()}, "
+                f"eta_epoch: {eta_str}"
+            )
 
-def run_validation(boat, val_dataloader, config, epoch):
+
+def run_validation(boat, dataloader, config, epoch):
 
     boat.eval()
     aggr_metrics = {}
 
-    dataset_length = len(val_dataloader.dataset) if hasattr(val_dataloader, 'dataset') else len(val_dataloader)
+    dataset_length = len(dataloader.dataset) if hasattr(dataloader, 'dataset') else len(dataloader)
 
     # Get Batch size from dataloader
-    batch_size = val_dataloader.batch_size if hasattr(val_dataloader, 'batch_size') else None
+    batch_size = dataloader.batch_size if hasattr(dataloader, 'batch_size') else None
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(val_dataloader):
+        for batch_idx, batch in enumerate(dataloader):
             metrics, named_imgs = boat.validation_step(batch, batch_idx, epoch)
             for key, value in metrics.items():
                 if key not in aggr_metrics:
@@ -199,6 +239,11 @@ def run_validation(boat, val_dataloader, config, epoch):
             if is_rank0():
                 boat.save_images(named_imgs, batch_idx)
                 print(f"Validation Completion: {batch_idx * batch_size * config['world_size']} / {dataset_length}, validation over {batch_idx + 1} batches done at global_step {boat.get_global_step()}")
+
+            # help GC
+            del batch, metrics, named_imgs
+            gc.collect()
+            torch.cuda.empty_cache()
 
         for key in aggr_metrics:
             aggr_metrics[key] /= (batch_idx + 1)
@@ -220,5 +265,34 @@ def run_validation(boat, val_dataloader, config, epoch):
     if target_metric_name not in aggr_metrics:
         raise KeyError(f"'{target_metric_name}' not found in validation metrics: {list(aggr_metrics)}")
 
+    # after loop:
+    gc.collect()
+    torch.cuda.empty_cache()
+
     return aggr_metrics[target_metric_name]
 
+
+def run_offline_evaluation(boat, dataloader, config):
+    boat.eval()
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            boat.offline_evaluation_iter(batch, batch_idx)
+
+    # waiting all rank to finish. 
+    if is_dist_ready():
+        dist.barrier()
+
+    if is_rank0():
+        offline_metrics = boat.offline_evaluation_final()
+        if offline_metrics is not None and len(offline_metrics) > 0:
+            boat.take_a_log(offline_metrics, 'eval')
+
+    if is_dist_ready():
+        dist.barrier()
+
+    # after loop:
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return None
